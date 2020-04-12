@@ -84,6 +84,19 @@ public final class PositionInfo
   }
 
   /**
+   * Obtains an instance based on the supplied info.
+   *
+   * @param info  the base info
+   * @return the position information
+   */
+  public static PositionInfo from(PortfolioItemInfo info) {
+    if (info instanceof PositionInfo) {
+      return ((PositionInfo) info);
+    }
+    return empty().combinedWith(info);
+  }
+
+  /**
    * Returns a builder used to create an instance of the bean.
    * 
    * @return the builder
@@ -119,6 +132,15 @@ public final class PositionInfo
       updatedAttributes.put(type, type.toStoredForm(value));
     }
     return new PositionInfo(id, updatedAttributes);
+  }
+
+  @Override
+  public PositionInfo withAttributes(Attributes other) {
+    PositionInfoBuilder builder = toBuilder();
+    for (AttributeType<?> attrType : other.getAttributeTypes()) {
+      builder.addAttribute(attrType.captureWildcard(), other.getAttribute(attrType));
+    }
+    return builder.build();
   }
 
   @Override
@@ -242,7 +264,7 @@ public final class PositionInfo
   public String toString() {
     StringBuilder buf = new StringBuilder(96);
     buf.append("PositionInfo{");
-    buf.append("id").append('=').append(id).append(',').append(' ');
+    buf.append("id").append('=').append(JodaBeanUtils.toString(id)).append(',').append(' ');
     buf.append("attributes").append('=').append(JodaBeanUtils.toString(attributes));
     buf.append('}');
     return buf.toString();

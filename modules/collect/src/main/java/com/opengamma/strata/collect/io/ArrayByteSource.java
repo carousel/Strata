@@ -17,8 +17,6 @@ import java.lang.annotation.Annotation;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -41,11 +39,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.hash.HashCode;
 import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hashing;
 import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteProcessor;
 import com.google.common.io.ByteSource;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.CharSource;
+import com.google.common.primitives.Bytes;
 import com.opengamma.strata.collect.ArgChecker;
 import com.opengamma.strata.collect.Unchecked;
 import com.opengamma.strata.collect.function.CheckedSupplier;
@@ -168,12 +168,50 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
     String fileName = null;
     if (other instanceof BeanByteSource) {
       fileName = ((BeanByteSource) other).getFileName().orElse(null);
+
+    } else if (other.getClass().getName().equals("com.google.common.io.ByteSource$ByteArrayByteSource")) {
+      // extract the byte[] without using reflection
+      // if the Guava implementation changes this could break, but that seems unlikely
+      ByteProcessor<byte[]> processor = new ByteProcessor<byte[]>() {
+        private byte[] captured;
+
+        @Override
+        public boolean processBytes(byte[] buf, int off, int len) throws IOException {
+          if (captured != null) {
+            // this defends against the Guava implementation being changed
+            captured = Bytes.concat(captured, Arrays.copyOfRange(buf, off, off + len));
+          } else if (off == 0 && len == buf.length) {
+            // this is the normal case where we can just assign the source
+            captured = buf;
+          } else {
+            // this happens if the source has been sliced
+            captured = Arrays.copyOfRange(buf, off, off + len);
+          }
+          return true;
+        }
+
+        @Override
+        public byte[] getResult() {
+          return captured;
+        }
+      };
+      return Unchecked.wrap(() -> new ArrayByteSource(other.read(processor)));
+
     } else {
+      // handle all other byte sources
       String str = other.toString();
-      if (str.startsWith("Files.asByteSource(")) {
+      if (str.equals("ByteSource.empty()")) {
+        return EMPTY;
+      } else if (str.startsWith("Files.asByteSource(")) {
+        // extract the file name from toString()
         int pos = str.indexOf(')', 19);
         fileName = Paths.get(str.substring(19, pos)).getFileName().toString();
+      } else if (str.startsWith("MoreFiles.asByteSource(")) {
+        // extract the path name from toString()
+        int pos = str.indexOf(',', 23);
+        fileName = Paths.get(str.substring(23, pos)).getFileName().toString();
       } else if (str.startsWith("Resources.asByteSource(")) {
+        // extract the URI from toString()
         int pos = str.indexOf(')', 23);
         String path = str.substring(23, pos);
         int lastSlash = path.lastIndexOf('/');
@@ -215,6 +253,44 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
   public static ArrayByteSource from(InputStream inputStream) throws IOException {
     byte[] bytes = ByteStreams.toByteArray(inputStream);
     return new ArrayByteSource(bytes);
+  }
+
+  /**
+   * Obtains an instance from an input stream, specifying the expected size.
+   * <p>
+   * This method uses an already open input stream, extracting the bytes.
+   * The stream is not closed - that is the responsibility of the caller.
+   * 
+   * @param inputStream  the open input stream, which will not be closed
+   * @param expectedSize  the expected size of the input, not negative
+   * @return the byte source
+   * @throws IOException if an IO error occurs
+   */
+  public static ArrayByteSource from(InputStream inputStream, int expectedSize) throws IOException {
+    ArgChecker.notNegative(expectedSize, "expectedSize");
+    byte[] main = new byte[expectedSize];
+    int remaining = expectedSize;
+    while (remaining > 0) {
+      int offset = expectedSize - remaining;
+      int read = inputStream.read(main, offset, remaining);
+      if (read == -1) {
+        // actual stream size < expected size
+        return new ArrayByteSource(Arrays.copyOf(main, offset));
+      }
+      remaining -= read;
+    }
+    // bytes is now full
+    int firstExcess = inputStream.read();
+    if (firstExcess == -1) {
+      // actual stream size == expected size
+      return new ArrayByteSource(main);
+    }
+    // actual stream size > expected size
+    byte[] excess = ByteStreams.toByteArray(inputStream);
+    byte[] result = Arrays.copyOf(main, main.length + 1 + excess.length);
+    result[main.length] = (byte) firstExcess;
+    System.arraycopy(excess, 0, result, main.length + 1, excess.length);
+    return new ArrayByteSource(result);
   }
 
   //-------------------------------------------------------------------------
@@ -319,38 +395,39 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
    */
   @Override
   public CharSource asCharSourceUtf8UsingBom() {
-    return CharSource.wrap(readUtf8UsingBom());
+    return UnicodeBom.toCharSource(this);
+  }
+
+  //-------------------------------------------------------------------------
+  @Override
+  public HashCode hash(HashFunction hashFunction) {
+    // overridden to use array directly for performance
+    return hashFunction.hashBytes(array);
   }
 
   //-------------------------------------------------------------------------
   /**
    * Returns the MD5 hash of the bytes.
+   * <p>
+   * The returned hash is in byte form.
    * 
    * @return the MD5 hash
+   * @deprecated Use {@link #toHash(HashFunction)}
    */
+  @Deprecated
   public ArrayByteSource toMd5() {
-    try {
-      // MessageDigest instances are not thread safe so must be created each time
-      MessageDigest md = MessageDigest.getInstance("MD5");
-      return ArrayByteSource.ofUnsafe(md.digest(array));
-    } catch (NoSuchAlgorithmException ex) {
-      throw new IllegalStateException(ex);
-    }
+    return toHash(Hashing.md5());
   }
 
   /**
    * Returns the SHA-512 hash of the bytes.
    * 
    * @return the SHA-512 hash
+   * @deprecated Use {@link #toHash(HashFunction)}
    */
+  @Deprecated
   public ArrayByteSource toSha512() {
-    try {
-      // MessageDigest instances are not thread safe so must be created each time
-      MessageDigest md = MessageDigest.getInstance("SHA-512");
-      return ArrayByteSource.ofUnsafe(md.digest(array));
-    } catch (NoSuchAlgorithmException ex) {
-      throw new IllegalStateException(ex);
-    }
+    return ArrayByteSource.ofUnsafe(hash(Hashing.sha512()).asBytes());
   }
 
   /**
@@ -358,7 +435,9 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
    * 
    * @return the base-64 encoded form
    */
+  @Override
   public ArrayByteSource toBase64() {
+    // overridden to use array directly for performance
     return ArrayByteSource.ofUnsafe(Base64.getEncoder().encode(array));
   }
 
@@ -369,7 +448,9 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
    * 
    * @return the base-64 encoded string
    */
+  @Override
   public String toBase64String() {
+    // overridden to use array directly for performance
     return Base64.getEncoder().encodeToString(array);
   }
 
@@ -441,11 +522,6 @@ public final class ArrayByteSource extends BeanByteSource implements ImmutableBe
   public <T> T read(ByteProcessor<T> processor) throws IOException {
     processor.processBytes(array, 0, array.length);
     return processor.getResult();
-  }
-
-  @Override
-  public HashCode hash(HashFunction hashFunction) {
-    return hashFunction.hashBytes(array);
   }
 
   @Override
